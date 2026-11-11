@@ -22,7 +22,7 @@ const S = {
   view: { az: 180, alt: 35, fov: 75 },            // where the finger has pointed, in drag mode
   camFov: load("camFov", 68),                     // the camera's vertical field of view, degrees
   yawOffset: load("yawOffset", 0),                // the compass's error, found by aligning
-  layers: Object.assign({ lines: true, names: true, planets: true, ground: true, sats: true, starlink: false }, load("layers", {})),
+  layers: Object.assign({ lines: true, names: true, planets: true, ground: true, sats: true, starlink: false, alb: true }, load("layers", {})),
   camera: false, target: null, q: null, selected: null, aligning: false, lastCompute: 0,
 };
 
@@ -252,7 +252,10 @@ function drawSelected(V) {
 
 // ---- satellites: orbits from CelesTrak, positions worked out on the phone (SGP4) ----
 const SAT = { list: [], next: 0, epoch: null };
-const NAMES = { "ISS (ZARYA)": "ISS", "HST": "Hubble", "CSS (TIANHE)": "Tiangong" };
+const NAMES = { "ISS (ZARYA)": "ISS", "HST": "Hubble", "CSS (TIANHE)": "Tiangong", "GREGOIRE": "Grégoire" };
+// Aerospacelab's satellites, built in Mont-Saint-Guibert (catalogue numbers; PVCC's maker is our best guess)
+const ALB = [56946, 58025, 59124, 59135, 59136, 59137];
+const GROUP_URLS = { visual: ["GROUP=visual"], starlink: ["GROUP=starlink"], alb: ALB.map((n) => "CATNR=" + n) };
 const STARS_OF_THE_SHOW = new Set(["ISS", "Hubble", "Tiangong"]);
 async function tle(group) {
   // CelesTrak updates a few times a day and asks to be fetched rarely: keep a copy for 6 hours, and the last good one for when it's down
@@ -260,13 +263,18 @@ async function tle(group) {
   if (cached && Date.now() - cached.at < 6 * 3600e3) return cached.text;
   try {
     const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 15000);
-    const r = await fetch(`https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`, { signal: ctl.signal }); clearTimeout(timer);
-    const text = await r.text();
-    if (!r.ok || !text.includes("\n1 ")) throw new Error("bad");
+    let text = "";
+    for (const q of GROUP_URLS[group]) {  // one request per query; any failure falls back to the last good copy
+      const r = await fetch(`https://celestrak.org/NORAD/elements/gp.php?${q}&FORMAT=tle`, { signal: ctl.signal });
+      const part = await r.text();
+      if (!r.ok || !part.includes("\n1 ")) throw new Error("bad");
+      text += part.trimEnd() + "\n";
+    }
+    clearTimeout(timer);
     save(key, { at: Date.now(), text }); return text;
   } catch (e) {
     if (cached) return cached.text;
-    if (group === "visual") return fetch("data/visual.tle").then((r) => r.text());  // the copy that ships with the page
+    if (group === "visual" || group === "alb") return fetch(`data/${group === "alb" ? "aerospacelab" : "visual"}.tle`).then((r) => r.text());  // the copy that ships with the page
     throw e;
   }
 }
@@ -285,8 +293,8 @@ function parseTle(text, group) {
 }
 async function loadSats() {
   try {
-    const groups = ["visual", ...(S.layers.starlink ? ["starlink"] : [])], lists = [];
-    for (const gr of groups) lists.push(parseTle(await tle(gr), gr));
+    const groups = ["alb", "visual", ...(S.layers.starlink ? ["starlink"] : [])], lists = [];
+    for (const gr of groups) { try { lists.push(parseTle(await tle(gr), gr)); } catch (e) { if (gr === "visual") throw e; } }
     const seen = new Set();  // a satellite in both groups is drawn once
     SAT.list = lists.flat().filter((s) => !seen.has(s.satrec.satnum) && seen.add(s.satrec.satnum));
     SAT.next = 0; SAT.epoch = new Date(Math.max(...SAT.list.map((s) => +s.epoch)));
@@ -310,7 +318,7 @@ function updateSats() {
   const n = SAT.list.length; if (!n) return;
   const date = new Date(), gmst = satellite.gstime(date), gd = observerGd(), t0 = performance.now();
   // the famous ones and the picked one every frame; the rest in turns, within 6 ms a frame
-  for (const s of SAT.list) if (STARS_OF_THE_SHOW.has(s.name)) placeSat(s, date, gmst, gd);
+  for (const s of SAT.list) if (STARS_OF_THE_SHOW.has(s.name) || s.group === "alb") placeSat(s, date, gmst, gd);
   if (S.selected?.sat) placeSat(S.selected.sat, date, gmst, gd);
   for (let k = 0; k < n && (k < 40 || performance.now() - t0 < 6); k++) { placeSat(SAT.list[SAT.next], date, gmst, gd); SAT.next = (SAT.next + 1) % n; }
 }
@@ -318,8 +326,9 @@ function drawSats(V) {
   const dark = S.sunAlt < -6;
   g.font = "600 13px ui-sans-serif, system-ui, sans-serif"; g.textAlign = "left";
   for (const s of SAT.list) {
-    if (!s.enu) continue;
+    if (!s.enu || (s.group === "alb" && !S.layers.alb)) continue;
     const p = project(V, s.enu); if (!onScreen(p, 10)) continue;
+    if (s.group === "alb") { drawAlb(p, s); continue; }
     const star = STARS_OF_THE_SHOW.has(s.name), seen = s.lit && dark && s.enu[2] > 0, below = s.enu[2] < 0;
     const r = star ? 4 : s.group === "starlink" ? 1.4 : 2.2;
     g.globalAlpha = below ? 0.3 : seen ? 1 : 0.45;
@@ -330,6 +339,12 @@ function drawSats(V) {
     shown.push({ kind: "sat", s, x: p[0], y: p[1], r: star ? 6 : 0 });
   }
   if (S.selected?.sat) drawPath(V, S.selected.sat);
+}
+function drawAlb(p, s) {  // Belgian-made: gold, always named
+  g.globalAlpha = s.enu[2] < 0 ? 0.45 : 1; g.fillStyle = "#ffd84d";
+  g.beginPath(); g.moveTo(p[0], p[1] - 5); g.lineTo(p[0] + 5, p[1]); g.lineTo(p[0], p[1] + 5); g.lineTo(p[0] - 5, p[1]); g.closePath(); g.fill();
+  g.font = "600 13px ui-sans-serif, system-ui, sans-serif"; g.textAlign = "left"; g.fillText(s.name, p[0] + 10, p[1] + 5);
+  g.globalAlpha = 1; shown.push({ kind: "sat", s, x: p[0], y: p[1], r: 6 });
 }
 function drawPath(V, s) {
   // where it's heading: the next 4 minutes, a dot every 20 seconds
@@ -342,14 +357,14 @@ function drawPath(V, s) {
   g.globalAlpha = 1;
 }
 function sunAltAt(date) { const t = A.MakeTime(date), eq = A.Equator(A.Body.Sun, t, S.observer, true, true); return A.Horizon(t, S.observer, eq.ra, eq.dec, "").altitude; }
-function nextPass(s) {
-  // the next time it's at least 10° up, in sunlight, while the sky here is dark: up to three days ahead, in 20-second steps
+function nextPass(s, seeable = true) {
+  // the next time it's at least 10° up (and, to be seen, in sunlight while the sky here is dark): up to three days ahead, in 20-second steps
   const step = 20000, start = Date.now(), gd = observerGd(), sun = new Map();
   const dark = (t) => { const k = Math.floor(t / 300000); if (!sun.has(k)) sun.set(k, sunAltAt(new Date(k * 300000)) < -6); return sun.get(k); };
   let pass = null;
   for (let t = start; t < start + 3 * 864e5; t += step) {
     const c = { satrec: s.satrec }; placeSat(c, new Date(t), satellite.gstime(new Date(t)), gd);
-    const [alt, az] = c.enu ? vecAltAz(c.enu) : [-90, 0], ok = alt >= 10 && c.lit && dark(t);
+    const [alt, az] = c.enu ? vecAltAz(c.enu) : [-90, 0], ok = alt >= 10 && (!seeable || (c.lit && dark(t)));
     if (ok && !pass) pass = { start: new Date(t), from: az, max: alt };
     else if (ok) { pass.max = Math.max(pass.max, alt); pass.to = az; pass.end = new Date(t); }
     else if (pass) return pass;
@@ -364,12 +379,14 @@ function satCard(s) {
   const rows = [["Where", s.enu ? where(s.enu) : ""], ["Now", status], ["Height", `${Math.round(s.height)} km`],
                 ["Speed", `${(s.speed * 3600).toLocaleString(undefined, { maximumFractionDigits: 0 })} km/h`], ["Distance", `${Math.round(s.range).toLocaleString()} km from you`], ["Next pass", "working it out…"]];
   const orbits = `Orbit data from ${SAT.epoch ? SAT.epoch.toLocaleDateString() : "?"}.`;
-  card(s.group === "starlink" ? "Starlink satellite" : "Satellite", s.name, rows, orbits);
+  const kind = s.group === "starlink" ? "Starlink satellite" : s.group === "alb" ? "Aerospacelab satellite" : "Satellite";
+  const note = s.group === "alb" ? `Built by Aerospacelab in Mont-Saint-Guibert${s.name === "PVCC" ? " (most likely)" : ""}. Too small to see with the naked eye. ${orbits}` : orbits;
+  card(kind, s.name, rows, note);
   setTimeout(() => {  // the pass search takes a moment: the card shows first
     if (S.selected?.sat !== s) return;
-    const p = nextPass(s);
-    rows[5][1] = p ? `${dayWord(p.start)} ${fmtTime(p.start)}, from the ${dirName(p.from)} to the ${dirName(p.to ?? p.from)}, up to ${Math.round(p.max)}° (${Math.max(1, Math.round(((p.end || p.start) - p.start) / 60000))} min)` : "None visible in the next three days";
-    card(s.group === "starlink" ? "Starlink satellite" : "Satellite", s.name, rows, orbits);
+    const p = nextPass(s, s.group !== "alb");
+    rows[5][1] = p ? `${dayWord(p.start)} ${fmtTime(p.start)}, from the ${dirName(p.from)} to the ${dirName(p.to ?? p.from)}, up to ${Math.round(p.max)}° (${Math.max(1, Math.round(((p.end || p.start) - p.start) / 60000))} min)` : s.group === "alb" ? "None in the next three days" : "None visible in the next three days";
+    card(kind, s.name, rows, note);
   }, 30);
 }
 

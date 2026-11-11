@@ -9,5 +9,5 @@ If the labels sit beside the real stars (phone compasses are off by a few degree
 ## Credits
 
 - Star, constellation and star-name data: [d3-celestial](https://github.com/ofrohn/d3-celestial) by Olaf Frohn (BSD 3-Clause, see `LICENSES/d3-celestial.txt`), from the Yale Bright Star and Hipparcos catalogues.
-- Satellite orbits: [CelesTrak](https://celestrak.org) (fetched at most every 6 hours; `data/visual.tle` is a fallback copy), propagated with [satellite.js](https://github.com/shashwatak/satellite-js) (MIT, header of `lib/satellite.min.js`).
+- Satellite orbits: [CelesTrak](https://celestrak.org) (fetched at most every 6 hours; `data/visual.tle` and `data/aerospacelab.tle` are fallback copies), propagated with [satellite.js](https://github.com/shashwatak/satellite-js) (MIT, header of `lib/satellite.min.js`).
 - Positions of the Sun, Moon and planets, and the sky's rotation: [Astronomy Engine](https://github.com/cosinekitty/astronomy) by Don Cross (MIT, header of `lib/astronomy.browser.min.js`).
