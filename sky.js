@@ -22,7 +22,7 @@ const S = {
   view: { az: 180, alt: 35, fov: 75 },            // where the finger has pointed, in drag mode
   camFov: load("camFov", 68),                     // the camera's vertical field of view, degrees
   yawOffset: load("yawOffset", 0),                // the compass's error, found by aligning
-  layers: Object.assign({ lines: true, names: true, planets: true, ground: true }, load("layers", {})),
+  layers: Object.assign({ lines: true, names: true, planets: true, ground: true, sats: true, starlink: false }, load("layers", {})),
   camera: false, target: null, q: null, selected: null, aligning: false, lastCompute: 0,
 };
 
@@ -68,6 +68,7 @@ function compute() {
     return { kind: "body", name, color, enu: altAzVec(h.altitude, h.azimuth), dist: eq.dist, mag, phase, ra: eq.ra, dec: eq.dec };
   });
   S.sunAlt = vecAltAz(S.bodies[0].enu)[0];
+  const sv = A.GeoVector(A.Body.Sun, t, true), sn = Math.hypot(sv.x, sv.y, sv.z); S.sunDir = [sv.x / sn, sv.y / sn, sv.z / sn];
   S.lastCompute = performance.now();
 }
 
@@ -153,6 +154,7 @@ function draw() {
   if (S.layers.lines) drawLines(V);
   drawStars(V);
   if (S.layers.names) drawConstellationNames(V);
+  if (S.layers.sats) { updateSats(); drawSats(V); }
   if (S.layers.planets) drawBodies(V);
   drawSelected(V);
   const fwd = V.back.map((v) => -v), [alt, az] = vecAltAz(fwd);
@@ -248,6 +250,129 @@ function drawSelected(V) {
   g.beginPath(); g.moveTo(14, 0); g.lineTo(-8, -10); g.lineTo(-3, 0); g.lineTo(-8, 10); g.closePath(); g.fill(); g.restore();
 }
 
+// ---- satellites: orbits from CelesTrak, positions worked out on the phone (SGP4) ----
+const SAT = { list: [], next: 0, epoch: null };
+const NAMES = { "ISS (ZARYA)": "ISS", "HST": "Hubble", "CSS (TIANHE)": "Tiangong" };
+const STARS_OF_THE_SHOW = new Set(["ISS", "Hubble", "Tiangong"]);
+async function tle(group) {
+  // CelesTrak updates a few times a day and asks to be fetched rarely: keep a copy for 6 hours, and the last good one for when it's down
+  const key = "tle." + group, cached = load(key, null);
+  if (cached && Date.now() - cached.at < 6 * 3600e3) return cached.text;
+  try {
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 15000);
+    const r = await fetch(`https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`, { signal: ctl.signal }); clearTimeout(timer);
+    const text = await r.text();
+    if (!r.ok || !text.includes("\n1 ")) throw new Error("bad");
+    save(key, { at: Date.now(), text }); return text;
+  } catch (e) {
+    if (cached) return cached.text;
+    if (group === "visual") return fetch("data/visual.tle").then((r) => r.text());  // the copy that ships with the page
+    throw e;
+  }
+}
+function parseTle(text, group) {
+  const L = text.split(/\r?\n/).map((l) => l.trimEnd()).filter(Boolean), out = [];
+  for (let i = 0; i + 2 < L.length + 1; i++) {
+    if (!L[i + 1]?.startsWith("1 ") || !L[i + 2]?.startsWith("2 ")) continue;
+    try {
+      const satrec = satellite.twoline2satrec(L[i + 1], L[i + 2]), raw = L[i].trim();
+      const year = satrec.epochyr < 57 ? 2000 + satrec.epochyr : 1900 + satrec.epochyr;
+      out.push({ name: NAMES[raw] || raw, satrec, group, epoch: new Date(Date.UTC(year, 0, 1) + (satrec.epochdays - 1) * 864e5) });
+    } catch (e) {}
+    i += 2;
+  }
+  return out;
+}
+async function loadSats() {
+  try {
+    const groups = ["visual", ...(S.layers.starlink ? ["starlink"] : [])], lists = [];
+    for (const gr of groups) lists.push(parseTle(await tle(gr), gr));
+    const seen = new Set();  // a satellite in both groups is drawn once
+    SAT.list = lists.flat().filter((s) => !seen.has(s.satrec.satnum) && seen.add(s.satrec.satnum));
+    SAT.next = 0; SAT.epoch = new Date(Math.max(...SAT.list.map((s) => +s.epoch)));
+  } catch (e) { toast("Couldn't load the satellites' orbits. Try again later."); }
+}
+function sunlit(r) {  // outside Earth's shadow (a cylinder behind the Earth, away from the Sun)
+  if (!S.sunDir) return true;
+  const d = r.x * S.sunDir[0] + r.y * S.sunDir[1] + r.z * S.sunDir[2];
+  if (d > 0) return true;
+  return Math.hypot(r.x - d * S.sunDir[0], r.y - d * S.sunDir[1], r.z - d * S.sunDir[2]) > 6371;
+}
+const observerGd = () => ({ latitude: S.observer.latitude * D2R, longitude: S.observer.longitude * D2R, height: (S.observer.height || 0) / 1000 });
+function placeSat(s, date, gmst = satellite.gstime(date), gd = observerGd()) {
+  const pv = satellite.propagate(s.satrec, date);
+  if (!pv || !pv.position) { s.enu = null; return; }
+  const la = satellite.ecfToLookAngles(gd, satellite.eciToEcf(pv.position, gmst));
+  s.enu = altAzVec(la.elevation * R2D, la.azimuth * R2D); s.range = la.rangeSat; s.lit = sunlit(pv.position);
+  s.height = satellite.eciToGeodetic(pv.position, gmst).height; s.speed = Math.hypot(pv.velocity.x, pv.velocity.y, pv.velocity.z);
+}
+function updateSats() {
+  const n = SAT.list.length; if (!n) return;
+  const date = new Date(), gmst = satellite.gstime(date), gd = observerGd(), t0 = performance.now();
+  // the famous ones and the picked one every frame; the rest in turns, within 6 ms a frame
+  for (const s of SAT.list) if (STARS_OF_THE_SHOW.has(s.name)) placeSat(s, date, gmst, gd);
+  if (S.selected?.sat) placeSat(S.selected.sat, date, gmst, gd);
+  for (let k = 0; k < n && (k < 40 || performance.now() - t0 < 6); k++) { placeSat(SAT.list[SAT.next], date, gmst, gd); SAT.next = (SAT.next + 1) % n; }
+}
+function drawSats(V) {
+  const dark = S.sunAlt < -6;
+  g.font = "600 13px ui-sans-serif, system-ui, sans-serif"; g.textAlign = "left";
+  for (const s of SAT.list) {
+    if (!s.enu) continue;
+    const p = project(V, s.enu); if (!onScreen(p, 10)) continue;
+    const star = STARS_OF_THE_SHOW.has(s.name), seen = s.lit && dark && s.enu[2] > 0, below = s.enu[2] < 0;
+    const r = star ? 4 : s.group === "starlink" ? 1.4 : 2.2;
+    g.globalAlpha = below ? 0.3 : seen ? 1 : 0.45;
+    g.fillStyle = seen ? "#fff6d8" : s.lit ? "#cfe0ff" : "#7d879c";
+    g.beginPath(); g.moveTo(p[0], p[1] - r - 1); g.lineTo(p[0] + r + 1, p[1]); g.lineTo(p[0], p[1] + r + 1); g.lineTo(p[0] - r - 1, p[1]); g.closePath(); g.fill();  // a small diamond
+    if (star) { g.fillStyle = seen ? "#fff6d8" : "#b8c6e0"; g.fillText(s.name, p[0] + r + 7, p[1] + 5); }
+    g.globalAlpha = 1;
+    shown.push({ kind: "sat", s, x: p[0], y: p[1], r: star ? 6 : 0 });
+  }
+  if (S.selected?.sat) drawPath(V, S.selected.sat);
+}
+function drawPath(V, s) {
+  // where it's heading: the next 4 minutes, a dot every 20 seconds
+  if (!s.path || performance.now() - s.pathAt > 5000) {
+    const now = Date.now(); s.path = []; s.pathAt = performance.now();
+    for (let k = 1; k <= 12; k++) { const t = new Date(now + k * 20000), c = { satrec: s.satrec }; placeSat(c, t); if (c.enu) s.path.push(c.enu); }
+  }
+  g.fillStyle = "#f2c46d";
+  s.path.forEach((v, k) => { const p = project(V, v); if (!onScreen(p)) return; g.globalAlpha = 1 - k / 13; g.beginPath(); g.arc(p[0], p[1], 2.2, 0, 7); g.fill(); });
+  g.globalAlpha = 1;
+}
+function sunAltAt(date) { const t = A.MakeTime(date), eq = A.Equator(A.Body.Sun, t, S.observer, true, true); return A.Horizon(t, S.observer, eq.ra, eq.dec, "").altitude; }
+function nextPass(s) {
+  // the next time it's at least 10° up, in sunlight, while the sky here is dark: up to three days ahead, in 20-second steps
+  const step = 20000, start = Date.now(), gd = observerGd(), sun = new Map();
+  const dark = (t) => { const k = Math.floor(t / 300000); if (!sun.has(k)) sun.set(k, sunAltAt(new Date(k * 300000)) < -6); return sun.get(k); };
+  let pass = null;
+  for (let t = start; t < start + 3 * 864e5; t += step) {
+    const c = { satrec: s.satrec }; placeSat(c, new Date(t), satellite.gstime(new Date(t)), gd);
+    const [alt, az] = c.enu ? vecAltAz(c.enu) : [-90, 0], ok = alt >= 10 && c.lit && dark(t);
+    if (ok && !pass) pass = { start: new Date(t), from: az, max: alt };
+    else if (ok) { pass.max = Math.max(pass.max, alt); pass.to = az; pass.end = new Date(t); }
+    else if (pass) return pass;
+  }
+  return pass;
+}
+const dayWord = (d) => { const today = new Date(); today.setHours(0, 0, 0, 0); const k = Math.floor((d - today) / 864e5); return k === 0 ? "Today" : k === 1 ? "Tomorrow" : d.toLocaleDateString([], { weekday: "long" }); };
+function satCard(s) {
+  placeSat(s, new Date());
+  const dark = S.sunAlt < -6, up = s.enu && s.enu[2] > 0;
+  const status = !s.lit ? "In the Earth's shadow: invisible right now" : !up ? "In sunlight, below your horizon" : dark ? "In sunlight against a dark sky: look for a steady moving star" : "In sunlight, but your sky is too bright to see it";
+  const rows = [["Where", s.enu ? where(s.enu) : ""], ["Now", status], ["Height", `${Math.round(s.height)} km`],
+                ["Speed", `${(s.speed * 3600).toLocaleString(undefined, { maximumFractionDigits: 0 })} km/h`], ["Distance", `${Math.round(s.range).toLocaleString()} km from you`], ["Next pass", "working it out…"]];
+  const orbits = `Orbit data from ${SAT.epoch ? SAT.epoch.toLocaleDateString() : "?"}.`;
+  card(s.group === "starlink" ? "Starlink satellite" : "Satellite", s.name, rows, orbits);
+  setTimeout(() => {  // the pass search takes a moment: the card shows first
+    if (S.selected?.sat !== s) return;
+    const p = nextPass(s);
+    rows[5][1] = p ? `${dayWord(p.start)} ${fmtTime(p.start)}, from the ${dirName(p.from)} to the ${dirName(p.to ?? p.from)}, up to ${Math.round(p.max)}° (${Math.max(1, Math.round(((p.end || p.start) - p.start) / 60000))} min)` : "None visible in the next three days";
+    card(s.group === "starlink" ? "Starlink satellite" : "Satellite", s.name, rows, orbits);
+  }, 30);
+}
+
 // ---- touch: drag to look (or to align), pinch to zoom, tap to ask what something is ----
 const pointers = new Map(); let dragged = 0, pinch = null;
 canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); pointers.set(e.pointerId, [e.clientX, e.clientY]); dragged = 0;
@@ -277,6 +402,7 @@ function tap(x, y) {
   let best = null, bd = 30;
   for (const o of shown) { const d = Math.hypot(o.x - x, o.y - y) - (o.r || 0) * 0.5 - (o.kind === "body" ? 6 : 0); if (d < bd) { bd = d; best = o; } }
   if (!best) { S.selected = null; $("#card").hidden = true; return; }
+  if (best.kind === "sat") { const s = best.s; S.selected = { vec: () => s.enu || [0, 0, -1], sat: s }; satCard(s); return; }
   if (best.kind === "star") { const i = best.i; S.selected = { vec: () => [ENU[i * 3], ENU[i * 3 + 1], ENU[i * 3 + 2]] }; starCard(i); }
   else { const name = best.b.name; S.selected = { vec: () => S.bodies.find((b) => b.name === name).enu }; bodyCard(name); }
 }
@@ -345,9 +471,15 @@ $("#align").addEventListener("click", () => {
 });
 $("#align-done").addEventListener("click", () => $("#align").click());
 document.querySelectorAll("[data-layer]").forEach((box) => { box.checked = S.layers[box.dataset.layer];
-  box.addEventListener("change", () => { S.layers[box.dataset.layer] = box.checked; save("layers", S.layers); }); });
+  box.addEventListener("change", () => { S.layers[box.dataset.layer] = box.checked; save("layers", S.layers); if (box.dataset.layer === "starlink") loadSats(); }); });
+$("#find-iss").addEventListener("click", () => {
+  const iss = SAT.list.find((s) => s.name === "ISS");
+  if (!iss) { toast("The satellites haven't loaded yet."); return; }
+  $("#sheet").hidden = true; $("#menu").setAttribute("aria-pressed", "false");
+  placeSat(iss, new Date()); S.selected = { vec: () => iss.enu || [0, 0, -1], sat: iss }; satCard(iss);
+});
 $("#fov").addEventListener("input", (e) => { S.camFov = +e.target.value; save("camFov", S.camFov); });
 $("#place").textContent = S.placeName;
 setInterval(() => ($("#clock").textContent = fmtTime(new Date())), 1000);
 $("#clock").textContent = fmtTime(new Date());
-loadSky().then(() => requestAnimationFrame(draw));
+loadSky().then(() => { requestAnimationFrame(draw); loadSats(); });

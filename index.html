@@ -71,9 +71,12 @@ body.red { filter: grayscale(1) sepia(1) saturate(6) hue-rotate(-48deg) brightne
   <label>Constellation lines <input type="checkbox" data-layer="lines" checked></label>
   <label>Names <input type="checkbox" data-layer="names" checked></label>
   <label>Planets, Sun and Moon <input type="checkbox" data-layer="planets" checked></label>
+  <label>Satellites <input type="checkbox" data-layer="sats" checked></label>
+  <label>Starlink (thousands) <input type="checkbox" data-layer="starlink"></label>
   <label>Ground <input type="checkbox" data-layer="ground" checked></label>
   <label>Camera zoom <input type="range" id="fov" min="40" max="100" step="1"></label>
   <small>If the drawn sky looks bigger or smaller than the real one, slide the camera zoom until they match.</small>
+  <button class="btn ghost" id="find-iss" style="width:100%;margin-top:10px">Where's the ISS?</button>
 </div>
 
 <div class="card" id="card" hidden></div>
@@ -81,7 +84,7 @@ body.red { filter: grayscale(1) sepia(1) saturate(6) hue-rotate(-48deg) brightne
 <div id="start">
   <div class="box">
     <h1>Sky</h1>
-    <p>Hold your phone up: every star, constellation and planet in view, named on the camera image. Point it at the ground to see the sky on the other side of the Earth.</p>
+    <p>Hold your phone up: every star, constellation, planet and satellite in view, named on the camera image. Point it at the ground to see the sky on the other side of the Earth.</p>
     <button class="btn" id="go-camera">Start with the camera</button>
     <button class="btn ghost" id="go-drag">Explore without the camera</button>
     <small>Uses your location to place the sky, the camera and the motion sensors. Nothing leaves your phone.</small>
@@ -89,6 +92,7 @@ body.red { filter: grayscale(1) sepia(1) saturate(6) hue-rotate(-48deg) brightne
 </div>
 
 <script src="lib/astronomy.browser.min.js"></script>
+<script src="lib/satellite.min.js"></script>
 <script src="sky.js"></script>
 </body>
 </html>
