@@ -24,7 +24,9 @@ const S = {
   yawOffset: load("yawOffset", 0),                // the compass's error, found by aligning
   layers: Object.assign({ lines: true, names: true, planets: true, ground: true, sats: true, starlink: false, alb: true }, load("layers", {})),
   camera: false, target: null, q: null, selected: null, aligning: false, lastCompute: 0,
+  timeOffset: 0,                                  // minutes ahead of (or behind) now, from the time slider
 };
+const skyNow = () => new Date(Date.now() + S.timeOffset * 60000);
 
 // ---- the catalogue: stars to magnitude 6, the constellation figures and their names ----
 let STARS = [], EQJ = null, ENU = null, COLOR = [], SEGS = [], CONS = [];
@@ -57,7 +59,7 @@ const altAzVec = (alt, az) => [Math.sin(az * D2R) * Math.cos(alt * D2R), Math.co
 const vecAltAz = (v) => [Math.asin(Math.max(-1, Math.min(1, v[2]))) * R2D, (Math.atan2(v[0], v[1]) * R2D + 360) % 360];
 function compute() {
   if (!EQJ) return;
-  const t = A.MakeTime(new Date()), rot = A.Rotation_EQJ_HOR(t, S.observer).rot;
+  const t = A.MakeTime(skyNow()), rot = A.Rotation_EQJ_HOR(t, S.observer).rot;
   for (let i = 0; i < STARS.length; i++) ENU.set(toEnu(rot, [EQJ[i * 3], EQJ[i * 3 + 1], EQJ[i * 3 + 2]]), i * 3);
   for (const s of SEGS) s.enu = s.eqj.map((v) => toEnu(rot, v));
   for (const c of CONS) c.enu = toEnu(rot, c.eqj);
@@ -158,7 +160,7 @@ function draw() {
   if (S.layers.planets) drawBodies(V);
   drawSelected(V);
   const fwd = V.back.map((v) => -v), [alt, az] = vecAltAz(fwd);
-  $("#looking").textContent = `${dirName(az)[0].toUpperCase() + dirName(az).slice(1)} ${Math.round(az)}° · ${alt >= 0 ? "up" : "down"} ${Math.abs(Math.round(alt))}°`;
+  $("#looking").textContent = `${DIRS[Math.round(az / 45) % 8]} ${Math.round(az)}° · ${alt >= 0 ? "up" : "down"} ${Math.abs(Math.round(alt))}°`;
 }
 function mix(a, b, t) { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(v + (y[i] - v) * t)).join(",")})`; }
 function drawGround(V) {
@@ -316,7 +318,7 @@ function placeSat(s, date, gmst = satellite.gstime(date), gd = observerGd()) {
 }
 function updateSats() {
   const n = SAT.list.length; if (!n) return;
-  const date = new Date(), gmst = satellite.gstime(date), gd = observerGd(), t0 = performance.now();
+  const date = skyNow(), gmst = satellite.gstime(date), gd = observerGd(), t0 = performance.now();
   // the famous ones and the picked one every frame; the rest in turns, within 6 ms a frame
   for (const s of SAT.list) if (STARS_OF_THE_SHOW.has(s.name) || s.group === "alb") placeSat(s, date, gmst, gd);
   if (S.selected?.sat) placeSat(S.selected.sat, date, gmst, gd);
@@ -349,7 +351,7 @@ function drawAlb(p, s) {  // Belgian-made: gold, always named
 function drawPath(V, s) {
   // where it's heading: the next 4 minutes, a dot every 20 seconds
   if (!s.path || performance.now() - s.pathAt > 5000) {
-    const now = Date.now(); s.path = []; s.pathAt = performance.now();
+    const now = +skyNow(); s.path = []; s.pathAt = performance.now();
     for (let k = 1; k <= 12; k++) { const t = new Date(now + k * 20000), c = { satrec: s.satrec }; placeSat(c, t); if (c.enu) s.path.push(c.enu); }
   }
   g.fillStyle = "#f2c46d";
@@ -359,7 +361,7 @@ function drawPath(V, s) {
 function sunAltAt(date) { const t = A.MakeTime(date), eq = A.Equator(A.Body.Sun, t, S.observer, true, true); return A.Horizon(t, S.observer, eq.ra, eq.dec, "").altitude; }
 function nextPass(s, seeable = true) {
   // the next time it's at least 10° up (and, to be seen, in sunlight while the sky here is dark): up to three days ahead, in 20-second steps
-  const step = 20000, start = Date.now(), gd = observerGd(), sun = new Map();
+  const step = 20000, start = +skyNow(), gd = observerGd(), sun = new Map();
   const dark = (t) => { const k = Math.floor(t / 300000); if (!sun.has(k)) sun.set(k, sunAltAt(new Date(k * 300000)) < -6); return sun.get(k); };
   let pass = null;
   for (let t = start; t < start + 3 * 864e5; t += step) {
@@ -373,7 +375,7 @@ function nextPass(s, seeable = true) {
 }
 const dayWord = (d) => { const today = new Date(); today.setHours(0, 0, 0, 0); const k = Math.floor((d - today) / 864e5); return k === 0 ? "Today" : k === 1 ? "Tomorrow" : d.toLocaleDateString([], { weekday: "long" }); };
 function satCard(s) {
-  placeSat(s, new Date());
+  placeSat(s, skyNow());
   const dark = S.sunAlt < -6, up = s.enu && s.enu[2] > 0;
   const status = !s.lit ? "In the Earth's shadow: invisible right now" : !up ? "In sunlight, below your horizon" : dark ? "In sunlight against a dark sky: look for a steady moving star" : "In sunlight, but your sky is too bright to see it";
   const rows = [["Where", s.enu ? where(s.enu) : ""], ["Now", status], ["Height", `${Math.round(s.height)} km`],
@@ -419,9 +421,9 @@ function tap(x, y) {
   let best = null, bd = 30;
   for (const o of shown) { const d = Math.hypot(o.x - x, o.y - y) - (o.r || 0) * 0.5 - (o.kind === "body" ? 6 : 0); if (d < bd) { bd = d; best = o; } }
   if (!best) { S.selected = null; $("#card").hidden = true; return; }
-  if (best.kind === "sat") { const s = best.s; S.selected = { vec: () => s.enu || [0, 0, -1], sat: s }; satCard(s); return; }
-  if (best.kind === "star") { const i = best.i; S.selected = { vec: () => [ENU[i * 3], ENU[i * 3 + 1], ENU[i * 3 + 2]] }; starCard(i); }
-  else { const name = best.b.name; S.selected = { vec: () => S.bodies.find((b) => b.name === name).enu }; bodyCard(name); }
+  const keep = S.mode === "drag" ? S.view.az : null, alt = S.view.alt;  // a tap picks; it doesn't turn the view
+  if (best.kind === "sat") pickSat(best.s); else if (best.kind === "star") pickStar(best.i); else pickBody(best.b.name);
+  if (keep !== null) { S.view.az = keep; S.view.alt = alt; }
 }
 const fmtTime = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 const where = (v) => { const [alt, az] = vecAltAz(v); return alt < 0 ? `Below the horizon (${Math.round(-alt)}° down), ${dirName(az)}` : `${Math.round(alt)}° up, ${dirName(az)} (${Math.round(az)}°)`; };
@@ -439,12 +441,12 @@ function starCard(i) {
 }
 const NOTES = { Sun: "Never look at the Sun, through a lens least of all.", Moon: "", Venus: "The brightest thing in the sky after the Sun and Moon.", Jupiter: "Binoculars show up to four of its moons.", Saturn: "A small telescope shows the rings.", Mars: "", Mercury: "Always close to the Sun: look just after sunset or before sunrise.", Uranus: "Just at the edge of naked-eye visibility.", Neptune: "Needs binoculars or a telescope." };
 function bodyCard(name) {
-  const b = S.bodies.find((x) => x.name === name), t = A.MakeTime(new Date()), body = A.Body[name];
+  const b = S.bodies.find((x) => x.name === name), t = A.MakeTime(skyNow()), body = A.Body[name];
   const rise = A.SearchRiseSet(body, S.observer, +1, t, 1), set = A.SearchRiseSet(body, S.observer, -1, t, 1);
   const km = b.dist * 149597870.7;
   card(name === "Sun" || name === "Moon" ? name === "Sun" ? "Star" : "Moon" : "Planet", name, [
     ["Where", where(b.enu)],
-    ["Rises", rise ? fmtTime(rise.date) : ""], ["Sets", set ? fmtTime(set.date) : ""],
+    ["Rises", rise ? `${dayWord(rise.date)} ${fmtTime(rise.date)}` : ""], ["Sets", set ? `${dayWord(set.date)} ${fmtTime(set.date)}` : ""],
     ["Distance", name === "Moon" ? `${Math.round(km).toLocaleString()} km` : `${b.dist.toFixed(2)} AU · ${(km / 1e6).toFixed(0)} million km`],
     ["Brightness", b.mag != null ? `magnitude ${b.mag.toFixed(1)}` : ""],
     ["Lit", name !== "Sun" && b.phase != null ? `${Math.round(b.phase * 100)}%` : ""]], NOTES[name]);
@@ -476,6 +478,58 @@ async function keepAwake() { try { wake = await navigator.wakeLock?.request("scr
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && S.mode === "sensors") keepAwake(); });
 function toast(t) { document.querySelector(".toast")?.remove(); const d = Object.assign(document.createElement("div"), { className: "toast", textContent: t }); document.body.append(d); setTimeout(() => d.remove(), 5000); }
 
+// ---- time travel: the sky up to a day either side of now ----
+function setTime(min) {
+  S.timeOffset = Math.max(-1440, Math.min(1440, Math.round(min / 10) * 10));
+  $("#time-range").value = S.timeOffset; compute(); SAT.next = 0;
+  for (const s of SAT.list) s.path = null;
+  showClock(); $("#time-label").textContent = S.timeOffset ? $("#clock").textContent : "Now";
+  if (S.selected?.reopen) S.selected.reopen();
+}
+$("#clock").addEventListener("click", () => { const t = $("#timebar"); t.hidden = !t.hidden; document.body.classList.toggle("timing", !t.hidden); if (!t.hidden) { $("#searchbox").hidden = true; setTime(S.timeOffset); } });
+$("#time-range").addEventListener("input", (e) => setTime(+e.target.value));
+$("#time-now").addEventListener("click", () => setTime(0));
+$("#time-close").addEventListener("click", () => { $("#timebar").hidden = true; document.body.classList.remove("timing"); });
+
+// ---- search: anything with a name, then follow the arrow (or, without the camera, the view turns to it) ----
+const fold = (t) => t.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+function searchIndex() {
+  const items = [];
+  for (const [name] of BODIES) items.push({ name, sub: name === "Sun" ? "Star" : name === "Moon" ? "Moon" : "Planet", pick: () => pickBody(name) });
+  for (const c of CONS) items.push({ name: c.name, sub: "Constellation", pick: () => pickConstellation(c) });
+  STARS.forEach((s, i) => { if (s[4]) items.push({ name: s[4], sub: `Star, magnitude ${s[2].toFixed(1)}`, pick: () => pickStar(i) }); });
+  for (const sat of SAT.list) if (sat.group !== "starlink") items.push({ name: sat.name, sub: sat.group === "alb" ? "Aerospacelab satellite" : "Satellite", pick: () => pickSat(sat) });
+  return items;
+}
+function lookAt(v) { if (S.mode === "drag" && v) { const [alt, az] = vecAltAz(v); S.view.az = az; S.view.alt = Math.max(-80, Math.min(80, alt)); } }
+function pickBody(name) { const vec = () => S.bodies.find((b) => b.name === name).enu; S.selected = { vec, reopen: () => bodyCard(name) }; bodyCard(name); lookAt(vec()); }
+function pickStar(i) { const vec = () => [ENU[i * 3], ENU[i * 3 + 1], ENU[i * 3 + 2]]; S.selected = { vec, reopen: () => starCard(i) }; starCard(i); lookAt(vec()); }
+function pickSat(sat) { placeSat(sat, skyNow()); S.selected = { vec: () => sat.enu || [0, 0, -1], sat, reopen: () => satCard(sat) }; satCard(sat); lookAt(sat.enu); }
+let consStars = null;
+function pickConstellation(c) {
+  if (!consStars) { consStars = {}; STARS.forEach((s, i) => { if (s[2] < 4) (consStars[A.Constellation(s[0] / 15, s[1]).symbol] ||= []).push(i); }); }
+  const show = () => {
+    const mine = consStars[c.id] || [], top = mine.slice(0, 3).map((i) => STARS[i][4] || null).filter(Boolean);
+    card("Constellation", c.name, [["Where", where(c.enu)], ["Bright stars", mine.length ? `${mine.length} brighter than magnitude 4` : "none: a faint one"], ["Brightest", top.join(", ")]]);
+  };
+  S.selected = { vec: () => c.enu, reopen: show }; show(); lookAt(c.enu);
+}
+let INDEX = null;
+$("#search").addEventListener("click", () => {
+  const box = $("#searchbox"); box.hidden = !box.hidden; $("#timebar").hidden = true; document.body.classList.remove("timing");
+  if (!box.hidden) { INDEX = searchIndex(); $("#q").value = ""; renderResults(""); $("#q").focus(); }
+});
+$("#q").addEventListener("input", (e) => renderResults(e.target.value));
+$("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#results button")?.click(); if (e.key === "Escape") $("#searchbox").hidden = true; });
+function renderResults(q) {
+  const f = fold(q.trim());
+  const hits = !f ? INDEX.filter((x) => x.sub === "Planet" || x.name === "Moon" || x.name === "ISS").slice(0, 8)
+    : INDEX.map((x) => ({ x, k: fold(x.name).startsWith(f) ? 0 : fold(x.name).includes(f) ? 1 : 9 })).filter((r) => r.k < 9).sort((a, b) => a.k - b.k || a.x.name.length - b.x.name.length).slice(0, 8).map((r) => r.x);
+  $("#results").replaceChildren(...hits.map((x) => { const b = document.createElement("button"); b.innerHTML = `<b></b><span></span>`; b.querySelector("b").textContent = x.name; b.querySelector("span").textContent = x.sub;
+    b.addEventListener("click", () => { $("#searchbox").hidden = true; x.pick(); }); return b; }));
+  if (!hits.length && f) $("#results").innerHTML = `<p class="none">Nothing called that up there.</p>`;
+}
+
 // ---- the buttons ----
 $("#go-camera").addEventListener("click", startCamera);
 $("#go-drag").addEventListener("click", startDrag);
@@ -493,10 +547,14 @@ $("#find-iss").addEventListener("click", () => {
   const iss = SAT.list.find((s) => s.name === "ISS");
   if (!iss) { toast("The satellites haven't loaded yet."); return; }
   $("#sheet").hidden = true; $("#menu").setAttribute("aria-pressed", "false");
-  placeSat(iss, new Date()); S.selected = { vec: () => iss.enu || [0, 0, -1], sat: iss }; satCard(iss);
+  placeSat(iss, skyNow()); S.selected = { vec: () => iss.enu || [0, 0, -1], sat: iss }; satCard(iss);
 });
 $("#fov").addEventListener("input", (e) => { S.camFov = +e.target.value; save("camFov", S.camFov); });
 $("#place").textContent = S.placeName;
-setInterval(() => ($("#clock").textContent = fmtTime(new Date())), 1000);
-$("#clock").textContent = fmtTime(new Date());
+function showClock() {
+  const m = S.timeOffset, rel = !m ? "" : ` (${m > 0 ? "+" : "−"}${Math.abs(m) >= 60 ? `${Math.floor(Math.abs(m) / 60)} h ` : ""}${Math.abs(m) % 60 ? `${Math.abs(m) % 60} min` : ""})`.replace(" )", ")");
+  $("#clock").textContent = `${m ? dayWord(skyNow()) + " " : ""}${fmtTime(skyNow())}${rel}`;
+  $("#clock").classList.toggle("shifted", !!m);
+}
+setInterval(showClock, 1000); showClock();
 loadSky().then(() => { requestAnimationFrame(draw); loadSats(); });
